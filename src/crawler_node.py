@@ -1,99 +1,86 @@
 import asyncio
-import hashlib
-from typing import Dict, Set, List
-from dataclasses import dataclass
+from kademlia.network import Server
+from urllib.parse import urlparse
 import aiohttp
-import time
-
-@dataclass
-class CrawlTask:
-    url: str
-    depth: int
-    timestamp: float
-    owner_id: str
+import hashlib
+import json
 
 class CrawlerNode:
-    def __init__(self, node_id: str, peers: List[str], max_depth: int = 3):
-        self.node_id = node_id
-        self.peers = set(peers)
-        self.max_depth = max_depth
-        self.active_tasks: Dict[str, CrawlTask] = {}
-        self.completed_urls: Set[str] = set()
-        self.session = None
-
-    def task_id(self, url: str) -> str:
-        return hashlib.sha256(url.encode()).hexdigest()
+    def __init__(self, bootstrap_nodes=None, port=8468):
+        self.port = port
+        self.bootstrap_nodes = bootstrap_nodes or []
+        self.dht = Server()
+        self.discovered_content = set()
+        self.is_running = False
 
     async def start(self):
-        self.session = aiohttp.ClientSession()
-        await asyncio.gather(
-            self.run_crawler(),
-            self.run_gossip_protocol()
-        )
-
-    async def run_crawler(self):
-        while True:
-            for task_id, task in list(self.active_tasks.items()):
-                if task.owner_id == self.node_id:
-                    try:
-                        async with self.session.get(task.url) as response:
-                            if response.status == 200:
-                                text = await response.text()
-                                # Process links and create new tasks
-                                if task.depth < self.max_depth:
-                                    new_urls = self.extract_links(text)
-                                    await self.add_tasks(new_urls, task.depth + 1)
-                    except Exception as e:
-                        print(f"Error crawling {task.url}: {e}")
-                    finally:
-                        self.completed_urls.add(task.url)
-                        del self.active_tasks[task_id]
-            await asyncio.sleep(1)
-
-    async def run_gossip_protocol(self):
-        while True:
-            for peer in self.peers:
-                try:
-                    async with self.session.post(f"{peer}/sync", 
-                            json={
-                                "tasks": self.active_tasks,
-                                "completed": list(self.completed_urls)
-                            }) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            self.merge_state(data)
-                except Exception as e:
-                    print(f"Error syncing with peer {peer}: {e}")
-            await asyncio.sleep(5)
-
-    def merge_state(self, peer_state: dict):
-        """Merge peer state with local state using timestamp resolution"""
-        for task_id, task in peer_state["tasks"].items():
-            if task_id not in self.active_tasks or \
-               task.timestamp > self.active_tasks[task_id].timestamp:
-                self.active_tasks[task_id] = task
+        """Start the crawler node and connect to DHT network"""
+        await self.dht.listen(self.port)
+        if self.bootstrap_nodes:
+            await self.dht.bootstrap(self.bootstrap_nodes)
+        self.is_running = True
         
-        self.completed_urls.update(peer_state["completed"])
+    async def crawl_url(self, url):
+        """Crawl a URL and store its content hash in the DHT"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()
+                        
+                        # Store URL -> content hash mapping in DHT
+                        await self.dht.set(url, content_hash)
+                        
+                        # Store content hash -> metadata mapping
+                        metadata = {
+                            'url': url,
+                            'timestamp': str(asyncio.get_event_loop().time()),
+                            'title': self._extract_title(content)
+                        }
+                        await self.dht.set(content_hash, json.dumps(metadata))
+                        
+                        self.discovered_content.add(url)
+                        return content_hash
+        except Exception as e:
+            print(f'Error crawling {url}: {str(e)}')
+            return None
 
-    async def add_tasks(self, urls: List[str], depth: int):
-        """Add new crawl tasks if not already completed/active"""
-        timestamp = time.time()
-        for url in urls:
-            task_id = self.task_id(url)
-            if url not in self.completed_urls and task_id not in self.active_tasks:
-                self.active_tasks[task_id] = CrawlTask(
-                    url=url,
-                    depth=depth,
-                    timestamp=timestamp,
-                    owner_id=self.node_id
-                )
+    async def discover_content(self, search_key):
+        """Query DHT network for content matching search key"""
+        try:
+            content_hash = await self.dht.get(search_key)
+            if content_hash:
+                metadata = await self.dht.get(content_hash)
+                if metadata:
+                    return json.loads(metadata)
+        except Exception as e:
+            print(f'Error discovering content: {str(e)}')
+        return None
 
-    def extract_links(self, html: str) -> List[str]:
-        """Extract links from HTML content"""
-        # Implementation of link extraction logic
-        # Returns list of normalized URLs
-        return []
+    def _extract_title(self, html_content):
+        """Extract title from HTML content"""
+        try:
+            start = html_content.find('<title>')
+            end = html_content.find('</title>')
+            if start != -1 and end != -1:
+                return html_content[start+7:end].strip()
+        except:
+            pass
+        return ''
 
-    async def close(self):
-        if self.session:
-            await self.session.close()
+    async def stop(self):
+        """Stop the crawler node"""
+        self.is_running = False
+        self.dht.stop()
+
+    async def get_network_stats(self):
+        """Get statistics about the DHT network"""
+        return {
+            'node_id': self.dht.node.long_id,
+            'peers': len(self.dht.protocol.router.buckets),
+            'discovered_urls': len(self.discovered_content)
+        }
+
+    def __str__(self):
+        return f'CrawlerNode(port={self.port}, running={self.is_running})'
