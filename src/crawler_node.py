@@ -1,86 +1,55 @@
-import asyncio
-from kademlia.network import Server
-from urllib.parse import urlparse
-import aiohttp
+import requests
+from bs4 import BeautifulSoup
 import hashlib
 import json
+import time
+import random
 
 class CrawlerNode:
-    def __init__(self, bootstrap_nodes=None, port=8468):
-        self.port = port
-        self.bootstrap_nodes = bootstrap_nodes or []
-        self.dht = Server()
-        self.discovered_content = set()
-        self.is_running = False
+    def __init__(self, seed_urls, max_depth=3, max_pages=1000, delay=1):
+        self.seed_urls = seed_urls
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.delay = delay
+        self.visited_urls = set()
+        self.page_index = {}
 
-    async def start(self):
-        """Start the crawler node and connect to DHT network"""
-        await self.dht.listen(self.port)
-        if self.bootstrap_nodes:
-            await self.dht.bootstrap(self.bootstrap_nodes)
-        self.is_running = True
-        
-    async def crawl_url(self, url):
-        """Crawl a URL and store its content hash in the DHT"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        content = await response.text()
-                        content_hash = hashlib.sha256(content.encode()).hexdigest()
-                        
-                        # Store URL -> content hash mapping in DHT
-                        await self.dht.set(url, content_hash)
-                        
-                        # Store content hash -> metadata mapping
-                        metadata = {
+    def crawl(self):
+        queue = self.seed_urls.copy()
+        depth = 0
+
+        while queue and depth < self.max_depth and len(self.page_index) < self.max_pages:
+            depth += 1
+            new_queue = []
+
+            for url in queue:
+                if url not in self.visited_urls:
+                    self.visited_urls.add(url)
+                    try:
+                        response = requests.get(url)
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                        content = soup.get_text()
+                        page_hash = hashlib.sha256(content.encode()).hexdigest()
+                        self.page_index[page_hash] = {
                             'url': url,
-                            'timestamp': str(asyncio.get_event_loop().time()),
-                            'title': self._extract_title(content)
+                            'content': content
                         }
-                        await self.dht.set(content_hash, json.dumps(metadata))
-                        
-                        self.discovered_content.add(url)
-                        return content_hash
-        except Exception as e:
-            print(f'Error crawling {url}: {str(e)}')
-            return None
 
-    async def discover_content(self, search_key):
-        """Query DHT network for content matching search key"""
-        try:
-            content_hash = await self.dht.get(search_key)
-            if content_hash:
-                metadata = await self.dht.get(content_hash)
-                if metadata:
-                    return json.loads(metadata)
-        except Exception as e:
-            print(f'Error discovering content: {str(e)}')
-        return None
+                        for link in soup.find_all('a'):
+                            new_url = link.get('href')
+                            if new_url and new_url.startswith('http'):
+                                new_queue.append(new_url)
+                    except:
+                        pass
 
-    def _extract_title(self, html_content):
-        """Extract title from HTML content"""
-        try:
-            start = html_content.find('<title>')
-            end = html_content.find('</title>')
-            if start != -1 and end != -1:
-                return html_content[start+7:end].strip()
-        except:
-            pass
-        return ''
+                    time.sleep(self.delay + random.uniform(0, 1))
 
-    async def stop(self):
-        """Stop the crawler node"""
-        self.is_running = False
-        self.dht.stop()
+            queue = new_queue
 
-    async def get_network_stats(self):
-        """Get statistics about the DHT network"""
-        return {
-            'node_id': self.dht.node.long_id,
-            'peers': len(self.dht.protocol.router.buckets),
-            'discovered_urls': len(self.discovered_content)
-        }
+        return self.page_index
 
-    def __str__(self):
-        return f'CrawlerNode(port={self.port}, running={self.is_running})'
+if __name__ == '__main__':
+    seed_urls = ['https://en.wikipedia.org', 'https://www.github.com', 'https://www.reddit.com']
+    crawler = CrawlerNode(seed_urls)
+    index = crawler.crawl()
+    print(json.dumps(index, indent=2))
